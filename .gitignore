@@ -1,0 +1,40 @@
+# ===== Python =====
+# When Python runs your .py files, it compiles them to bytecode
+# and caches them in __pycache__/ folders. These are auto-generated
+# and should never be committed.
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== Virtual Environment =====
+# Your virtual environment contains hundreds of installed files
+# specific to your OS. Anyone can recreate it from requirements.txt.
+.venv/
+venv/
+env/
+
+# ===== Environment Variables =====
+# .env files often contain secrets (API keys, passwords).
+# Never commit them. We don't have one yet, but we will later.
+.env
+
+# ===== Logs =====
+# Telemetry logs are runtime output, not source code.
+# We want the logs/ directory to exist (for structure),
+# but not the actual log data.
+logs/*.jsonl
+logs/*.json
+logs/*.csv
+logs/*.log
+
+# ===== IDE / Editor =====
+# These are personal editor settings, not project code.
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OS Files =====
+# Operating system junk files.
+Thumbs.db
+.DS_Store
