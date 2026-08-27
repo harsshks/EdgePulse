@@ -1,57 +1,54 @@
+# simulator/publisher.py
+# Vehicle Simulator — generates randomized telemetry and publishes it via MQTT.
+# Week 3: configuration now imported from config.py instead of inline constants.
+
 import json
+import sys
+import os
 import time
 import random
+
 import paho.mqtt.client as mqtt
 
-# --- Configuration ---
-BROKER_HOST = "localhost"
-BROKER_PORT = 1883
-TOPIC = "telemetry/car1"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_TOPIC
+
 VEHICLE_ID = "car_01"
 
-def generate_telemetry():
-    """Generates fake, randomized telemetry data for a vehicle."""
+
+def generate_telemetry() -> dict:
+    """Generates one randomized vehicle telemetry reading."""
     return {
         "vehicle_id": VEHICLE_ID,
-        "speed": random.randint(40, 140),          # Speed in km/h
-        "rpm": random.randint(2000, 6000),         # Engine RPM
-        "engine_temp": random.randint(80, 110)     # Temperature in Celsius
+        "speed": random.randint(40, 140),       # km/h
+        "rpm": random.randint(2000, 6000),      # engine revolutions per minute
+        "engine_temp": random.randint(80, 110), # degrees Celsius
     }
+
 
 def main():
     print(f"🚗 Starting Vehicle Simulator ({VEHICLE_ID})...")
-    
-    # 1. Create the MQTT client
+
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    
+
     try:
-        # 2. Connect to the Mosquitto broker
-        client.connect(BROKER_HOST, BROKER_PORT)
-        print(f"✅ Connected to broker at {BROKER_HOST}:{BROKER_PORT}")
-        
-        # 3. Start the infinite loop to send data continuously
+        client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT)
+        print(f"✅ Connected to broker at {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
+
         while True:
-            # Generate the data dictionary
             data = generate_telemetry()
-            
-            # 4. Convert the Python dictionary to a JSON string
             payload = json.dumps(data)
-            
-            # 5. Publish to the topic
-            client.publish(TOPIC, payload)
-            
-            print(f"Published to {TOPIC}: {payload}")
-            
-            # 6. Wait 1 second before sending the next reading
+            client.publish(MQTT_TOPIC, payload)
+            print(f"📤 Published to {MQTT_TOPIC}: {payload}")
             time.sleep(1)
-            
+
     except KeyboardInterrupt:
-        # 7. Handle Ctrl+C gracefully
         print("\n🛑 Simulation stopped by user.")
     finally:
-        # Cleanly disconnect from the broker
         client.disconnect()
         print("Disconnected from broker.")
+
 
 if __name__ == "__main__":
     main()
