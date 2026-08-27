@@ -27,6 +27,11 @@ logs/*.json
 logs/*.csv
 logs/*.log
 
+# ===== Database =====
+# SQLite database is runtime state, not source code.
+# Anyone can recreate it by running the consumer or API.
+*.db
+
 # ===== IDE / Editor =====
 # These are personal editor settings, not project code.
 .vscode/
