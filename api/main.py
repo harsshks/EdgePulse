@@ -1,131 +1,134 @@
 # api/main.py
-# FastAPI application for EdgePulse.
+# FastAPI REST API for EdgePulse telemetry.
 #
-# === WHAT IS FastAPI? ===
-# FastAPI is a Python web framework for building HTTP APIs. It uses Python type
-# hints to automatically validate request/response data and auto-generates
-# interactive documentation at /docs (Swagger UI).
+# Responsibilities:
+#   - Expose stored telemetry over HTTP.
+#   - Validate query parameters (FastAPI + Pydantic handles this automatically).
+#   - Return structured JSON with correct HTTP status codes.
+#   - Report database availability via /health.
 #
-# === WHAT IS AN API? ===
-# An API (Application Programming Interface) is a defined way for one program
-# to talk to another. Here, external clients (your browser, Postman, another
-# service) ask EdgePulse questions over HTTP and get JSON answers back.
-#
-# === WHAT IS REST? ===
-# REST (Representational State Transfer) is a style of designing APIs using
-# standard HTTP methods:
-#   GET    — retrieve data   (read-only, safe to repeat)
-#   POST   — create data
-#   PUT    — replace data
-#   DELETE — remove data
-# We only need GET for Week 3.
-#
-# === HTTP REQUEST / RESPONSE ===
-# A request is: method + URL + optional body
-# A response is: status code + optional body (JSON here)
-#
-# === HTTP STATUS CODES ===
-# 200 OK           — success
-# 404 Not Found    — requested resource doesn't exist
-# 422 Unprocessable — request data failed validation
-# 500 Internal Error — something crashed on the server
-#
-# === ROUTES / ENDPOINTS ===
-# A route maps a URL path to a Python function.
-# @app.get("/health") means: when someone sends GET /health, call this function.
+# The API is read-only in Phase 0. Telemetry enters the system via MQTT,
+# not via POST requests. The two paths are intentionally independent.
 
-import sys
-import os
+import logging
 from contextlib import asynccontextmanager
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from database.db import init_db, get_latest_telemetry, get_telemetry, get_telemetry_by_vehicle
+from config import LOG_LEVEL
+from database.db import (
+    init_db,
+    get_latest_telemetry,
+    get_telemetry,
+    get_telemetry_by_vehicle,
+)
 
-# === PYDANTIC RESPONSE MODEL ===
-# Pydantic models define the shape of our API responses.
-# FastAPI uses them to:
-#   1. Serialize Python dicts to JSON automatically.
-#   2. Validate that every response contains the expected fields and types.
-#   3. Generate accurate documentation in /docs.
-# If a database row is missing a field, FastAPI raises an error rather than
-# silently returning broken JSON to the client.
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("edgepulse.api")
+
+
+# ---------------------------------------------------------------------------
+# Response model
+# ---------------------------------------------------------------------------
 
 class TelemetryRecord(BaseModel):
+    """
+    Defines the shape of every telemetry response.
+    FastAPI uses this to:
+      1. Serialise dicts to JSON.
+      2. Validate that every response has the expected fields and types.
+      3. Generate accurate /docs schema.
+
+    Fields:
+      id                  — internal database row ID
+      message_id          — deduplication identifier (may be None for legacy records)
+      event_timestamp     — UTC time the vehicle generated the reading
+      ingestion_timestamp — UTC time EdgePulse stored the reading
+      vehicle_id          — which vehicle sent this
+      speed / rpm / engine_temp — sensor values
+    """
     id: int
-    timestamp: str
+    message_id: str | None
+    event_timestamp: str
+    ingestion_timestamp: str
     vehicle_id: str
     speed: float
     rpm: float
     engine_temp: float
 
 
-# === APPLICATION INSTANCE ===
-# title and description appear at the top of /docs.
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """
-    Runs setup code before the first request (startup) and teardown after
-    the last request (shutdown). Using lifespan is the modern FastAPI pattern.
-    """
-    init_db()  # ensure the SQLite table exists
-    yield       # application runs here
+    """Initialise the database before accepting requests."""
+    logger.info("EdgePulse API starting — initialising database...")
+    init_db()
+    logger.info("Database ready.")
+    yield
+    logger.info("EdgePulse API shutting down.")
 
 
 app = FastAPI(
     title="EdgePulse Telemetry API",
     description=(
         "REST API for querying vehicle telemetry collected by the EdgePulse "
-        "edge consumer. Data flows: Vehicle → MQTT → Consumer → SQLite → this API."
+        "edge consumer.\n\n"
+        "Data flow: Vehicle → MQTT → Consumer → SQLite → this API."
     ),
-    version="1.0.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
-# --- Routes ---
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-@app.get("/", summary="Root — service identity")
+@app.get("/", summary="Service identity")
 def root():
-    """
-    Returns a simple JSON object identifying the service.
-    Useful for quickly confirming the API is reachable.
-    """
-    return {"service": "EdgePulse Telemetry API", "status": "running", "version": "1.0.0"}
+    """Returns service name and version. Useful for a quick reachability check."""
+    return {"service": "EdgePulse Telemetry API", "status": "running", "version": "0.3.0"}
 
 
 @app.get("/health", summary="Health check")
 def health():
     """
-    Health check endpoint.
-    In production, this is what a load balancer pings to know the service is alive.
-    We verify the database is reachable by attempting a lightweight query.
+    Verifies the API is running and the database is reachable.
     Returns 200 if healthy, 503 if the database is unavailable.
+    Suitable for use by a load balancer or monitoring system.
     """
     try:
-        # A cheap query — just checks DB connectivity, doesn't load all data
         get_telemetry(limit=1)
         return {"status": "healthy", "database": "reachable"}
     except Exception as e:
-        # 503 Service Unavailable — server is up but a dependency is down
+        logger.error("Health check failed: %s", e)
         raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
 
 
 @app.get(
     "/telemetry/latest",
     response_model=TelemetryRecord,
-    summary="Get the most recent telemetry record",
+    summary="Most recent telemetry record",
 )
 def latest_telemetry():
     """
-    Returns the single most recently received telemetry reading.
+    Returns the single most recently stored telemetry reading.
     404 if the database is empty (consumer hasn't run yet).
     """
-    record = get_latest_telemetry()
+    try:
+        record = get_latest_telemetry()
+    except Exception as e:
+        logger.error("Failed to fetch latest telemetry: %s", e)
+        raise HTTPException(status_code=503, detail="Database error")
+
     if record is None:
         raise HTTPException(
             status_code=404,
@@ -140,35 +143,44 @@ def latest_telemetry():
     summary="List recent telemetry records",
 )
 def list_telemetry(
-    limit: int = Query(default=20, ge=1, le=100, description="Number of records to return (1–100)")
+    limit: int = Query(
+        default=20, ge=1, le=100,
+        description="Number of records to return (1–100). Default: 20."
+    )
 ):
     """
     Returns up to `limit` recent telemetry records, newest first.
-
-    The `limit` query parameter is validated by FastAPI:
-    - Must be an integer (422 if not).
-    - Must be between 1 and 100 (422 if out of range).
-    Example: GET /telemetry?limit=5
+    FastAPI returns 422 automatically if `limit` is not an integer or is out of range.
     """
-    records = get_telemetry(limit=limit)
-    return records
+    try:
+        return get_telemetry(limit=limit)
+    except Exception as e:
+        logger.error("Failed to fetch telemetry list: %s", e)
+        raise HTTPException(status_code=503, detail="Database error")
 
 
 @app.get(
     "/telemetry/{vehicle_id}",
     response_model=list[TelemetryRecord],
-    summary="Get telemetry for a specific vehicle",
+    summary="Telemetry for a specific vehicle",
 )
 def vehicle_telemetry(
     vehicle_id: str,
-    limit: int = Query(default=20, ge=1, le=100, description="Number of records to return (1–100)")
+    limit: int = Query(
+        default=20, ge=1, le=100,
+        description="Number of records to return (1–100). Default: 20."
+    )
 ):
     """
-    Returns recent telemetry for the given vehicle_id.
+    Returns recent telemetry for the given vehicle_id, newest first.
     404 if no records exist for that vehicle.
-    Example: GET /telemetry/car_01
     """
-    records = get_telemetry_by_vehicle(vehicle_id=vehicle_id, limit=limit)
+    try:
+        records = get_telemetry_by_vehicle(vehicle_id=vehicle_id, limit=limit)
+    except Exception as e:
+        logger.error("Failed to fetch telemetry for vehicle '%s': %s", vehicle_id, e)
+        raise HTTPException(status_code=503, detail="Database error")
+
     if not records:
         raise HTTPException(
             status_code=404,
