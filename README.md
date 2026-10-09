@@ -306,3 +306,159 @@ Run the entire test suite:
 ```powershell
 pytest tests/ -v
 ```
+
+---
+
+## Phase 1 — Stateful Vehicle Simulation + Fault Injection
+
+Phase 1 replaces the simple random simulator with a realistic, stateful multi-vehicle simulation capable of producing temporally correlated telemetry and controlled fault scenarios. The output is designed to become the foundation for future anomaly-detection and predictive-maintenance experiments.
+
+Phase 1 does NOT implement any ML or anomaly detection. It only creates the high-quality synthetic dataset that future phases will consume.
+
+---
+
+### Simulator Architecture
+
+```
+simulator/
+├── vehicle.py      — VehicleProfile, VehicleStateMachine, VehicleState
+├── faults.py       — FaultScenario, FaultController, FaultType, FaultState
+└── publisher.py    — CLI entry point, MQTT publisher, run_simulation()
+```
+
+The three layers are independent:
+- `vehicle.py` — pure state machine, no I/O
+- `faults.py` — pure fault logic, no I/O
+- `publisher.py` — wires them together and handles MQTT + CLI
+
+---
+
+### Vehicle States
+
+```
+STOPPED → IDLE → ACCELERATING → CRUISING → DECELERATING → IDLE → ...
+```
+
+| State | Speed | RPM | Temperature |
+|---|---|---|---|
+| STOPPED | 0 | 0 | ambient |
+| IDLE | 0 | ~850 | gradually falls to idle baseline |
+| ACCELERATING | ↑ rising | ↑ rising + boost | ↑ rising under load |
+| CRUISING | ≈ stable ±noise | ≈ stable ±noise | ≈ stable at baseline |
+| DECELERATING | ↓ falling | ↓ falling | ↓ slowly falls |
+
+### Sensor Relationships
+
+- **RPM** = `idle_rpm + speed × rpm_per_kmh + accel_boost` (during acceleration)
+- **engine_temp** — converges toward a state-dependent target at a vehicle-specific rate
+- **battery_voltage** — slow mean-reversion to nominal with small Gaussian noise
+- **fuel_level** — decreases proportionally to load; never refuels in simulation
+
+### Vehicle Fleet
+
+| Vehicle | Baseline Temp | Idle RPM | Cruise Speed | Notes |
+|---|---|---|---|---|
+| CAR-01 | 88°C | 820 | 100 km/h | Reference vehicle |
+| CAR-02 | 93°C | 900 | 95 km/h | Runs hotter, heats faster |
+| CAR-03 | 86°C | 800 | 110 km/h | Cooler, faster, lower fuel use |
+
+---
+
+### Fault Scenarios
+
+| Fault | What it does | Telemetry signature |
+|---|---|---|
+| COOLING_DEGRADATION | engine_temp rises above normal | Gradual temp increase; slow recovery |
+| RPM_INSTABILITY | RPM oscillates around expected value | RPM std dev rises while speed is stable |
+| BATTERY_DEGRADATION | battery_voltage drops and becomes noisy | Voltage mean decreases; variance increases |
+| SENSOR_DRIFT | Temperature sensor bias accumulates | Reported temp drifts above actual over time |
+| EXCESSIVE_IDLING | Vehicle stays in IDLE far longer than normal | Long stretches of speed=0 and low RPM |
+
+All faults produce **valid telemetry** — values stay within Phase 0 validation ranges.
+
+### Fault Lifecycle
+
+```
+NORMAL → STARTING → ACTIVE → RECOVERING → RESOLVED → NORMAL
+```
+
+Each fault has configurable `ramp_time` (STARTING), `duration` (ACTIVE), and `recovery_time` (RECOVERING).
+
+---
+
+### Ground-Truth Labeling
+
+Fault metadata is recorded separately from the production telemetry so it never contaminates the MQTT pipeline or SQLite schema. Every simulated step produces a `GroundTruthRecord`:
+
+```
+sim_time | vehicle_id | message_id | event_timestamp | fault_type | fault_state | severity
+```
+
+This allows future ML models to be evaluated precisely: "at timestamp T, was vehicle V experiencing a fault, and if so, which one?"
+
+---
+
+### Running the Simulator
+
+Activate the virtual environment first:
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+**Normal mode** (healthy vehicles only):
+```powershell
+python simulator/publisher.py --mode normal --seed 42 --steps 600
+```
+
+**Fault mode** (one fault per vehicle):
+```powershell
+python simulator/publisher.py --mode fault --seed 42 --steps 900
+```
+
+**Mixed mode** (multiple faults per vehicle with recovery):
+```powershell
+python simulator/publisher.py --mode mixed --seed 7 --steps 1800
+```
+
+**Export ground-truth CSV** for ML experiments:
+```powershell
+python simulator/publisher.py --mode mixed --seed 42 --steps 1800 --export data/ground_truth.csv
+```
+
+**Options:**
+```
+--mode     normal | fault | mixed   (default: normal)
+--seed     integer                  (default: random — not reproducible)
+--steps    integer                  (default: 600)
+--dt       float seconds            (default: 1.0)
+--export   path/to/gt.csv           (optional)
+--vehicles CAR-01 CAR-02 ...        (default: all three)
+```
+
+### Reproducibility
+
+Running with the same `--seed` produces substantially identical telemetry. Use seeds in experiments to ensure results are comparable across algorithm versions.
+
+---
+
+### Current Milestone
+
+**Phase 1 — Stateful Simulation + Fault Injection** ✅
+
+Realistic multi-vehicle simulation with five fault types, full lifecycle tracking, ground-truth labeling, reproducible seeds, and CSV export for ML experiments.
+
+---
+
+## Future Roadmap
+
+| Phase | Focus |
+|---|---|
+| ✅ 0 | Foundation hardening — MQTT pipeline, SQLite, FastAPI |
+| ✅ 1 | Stateful simulation, fault injection, ground-truth labeling |
+| ⬜ 2 | Edge feature engineering + vehicle-specific baselines |
+| ⬜ 3 | LSTM-based temporal anomaly detection |
+| ⬜ 4 | Docker containerisation |
+| ⬜ 5 | CI/CD — GitHub Actions |
+| ⬜ 6 | Cloud deployment (AWS) |
+| ⬜ 7 | Monitoring — Prometheus + Grafana |
+| ⬜ 8 | Production hardening + predictive maintenance |

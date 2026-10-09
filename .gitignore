@@ -31,6 +31,11 @@ logs/*.log
 # SQLite database is runtime state, not source code.
 # Anyone can recreate it by running the consumer or API.
 *.db
+*.db.*
+
+# ===== Simulation data =====
+# Ground-truth CSV exports are generated artifacts, not source code.
+data/
 
 # ===== IDE / Editor =====
 # These are personal editor settings, not project code.
