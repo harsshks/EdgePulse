@@ -42,3 +42,20 @@ API_PORT: int = int(os.getenv("API_PORT", "8000"))
 # --- Logging ---
 _LOG_LEVEL_STR: str = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_LEVEL: int = getattr(logging, _LOG_LEVEL_STR, logging.INFO)
+
+# --- Phase 2: Feature Engineering ---
+# Rolling window length in number of observations (1 obs ≈ 1 second at default rate)
+FEATURE_WINDOW_SIZE: int = int(os.getenv("FEATURE_WINDOW_SIZE", "60"))
+
+# Minimum observations before rolling statistics are emitted
+FEATURE_MIN_SAMPLES: int = int(os.getenv("FEATURE_MIN_SAMPLES", "3"))
+
+# Minimum baseline samples before a baseline is considered ready
+BASELINE_MIN_SAMPLES: int = int(os.getenv("BASELINE_MIN_SAMPLES", "30"))
+
+# Engine temperature warning threshold (°C) — duration above this is tracked
+TEMP_WARNING_THRESHOLD: float = float(os.getenv("TEMP_WARNING_THRESHOLD", "100.0"))
+
+# Z-score thresholds for deviation levels
+SCORE_WARNING_THRESHOLD: float = float(os.getenv("SCORE_WARNING_THRESHOLD", "2.0"))
+SCORE_SEVERE_THRESHOLD: float  = float(os.getenv("SCORE_SEVERE_THRESHOLD", "3.5"))

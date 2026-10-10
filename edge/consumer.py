@@ -40,6 +40,7 @@ from config import (
 )
 from edge.validation import validate_telemetry
 from database.db import init_db, insert_telemetry
+from edge.pipeline import FeaturePipeline
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -50,6 +51,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("edgepulse.consumer")
+
+# Module-level pipeline instance — shared across all MQTT callbacks.
+# Initialised in main() after the database is ready.
+_pipeline: FeaturePipeline | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +84,15 @@ def process_telemetry(data: dict) -> dict | None:
 
     ingestion_ts = datetime.now(timezone.utc).isoformat()
 
+    def _optional_float(key: str) -> float | None:
+        val = data.get(key)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
     enriched = {
         "message_id":          data.get("message_id") or str(uuid.uuid4()),
         "event_timestamp":     data.get("event_timestamp") or ingestion_ts,
@@ -87,6 +101,8 @@ def process_telemetry(data: dict) -> dict | None:
         "speed":               float(data["speed"]),
         "rpm":                 float(data["rpm"]),
         "engine_temp":         float(data["engine_temp"]),
+        "battery_voltage":     _optional_float("battery_voltage"),
+        "fuel_level":          _optional_float("fuel_level"),
     }
     return enriched
 
@@ -169,7 +185,7 @@ def on_message(client, userdata, message):
     if record is None:
         return  # warning already logged inside process_telemetry
 
-    # 4. Persist to SQLite
+    # 4. Persist to SQLite — raw telemetry MUST be stored before feature pipeline runs
     try:
         inserted = insert_telemetry(record)
         if inserted:
@@ -186,12 +202,18 @@ def on_message(client, userdata, message):
     # 5. Append to JSONL audit log (always attempt, even if DB failed)
     log_to_jsonl(record)
 
+    # 6. Feature pipeline — runs AFTER raw telemetry is safely stored.
+    #    A pipeline failure never prevents telemetry from being persisted.
+    if _pipeline is not None and inserted:
+        _pipeline.process_record(record)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
+    global _pipeline
     logger.info("EdgePulse Consumer starting...")
 
     # Initialise database before accepting any messages
@@ -201,6 +223,11 @@ def main():
     except Exception as e:
         logger.critical("Cannot initialise database — aborting: %s", e)
         raise SystemExit(1)
+
+    # Initialise feature pipeline
+    _pipeline = FeaturePipeline()
+    _pipeline.load_baselines_from_db()
+    logger.info("Feature pipeline ready.")
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
