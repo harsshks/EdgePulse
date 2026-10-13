@@ -455,10 +455,160 @@ Realistic multi-vehicle simulation with five fault types, full lifecycle trackin
 |---|---|
 | ✅ 0 | Foundation hardening — MQTT pipeline, SQLite, FastAPI |
 | ✅ 1 | Stateful simulation, fault injection, ground-truth labeling |
-| ⬜ 2 | Edge feature engineering + vehicle-specific baselines |
-| ⬜ 3 | LSTM-based temporal anomaly detection |
+| ✅ 2 | Edge feature engineering + vehicle-specific baselines |
+| ✅ 3 | LSTM-based temporal anomaly detection |
 | ⬜ 4 | Docker containerisation |
 | ⬜ 5 | CI/CD — GitHub Actions |
 | ⬜ 6 | Cloud deployment (AWS) |
 | ⬜ 7 | Monitoring — Prometheus + Grafana |
 | ⬜ 8 | Production hardening + predictive maintenance |
+
+---
+
+## Phase 2 — Feature Engineering and Statistical Baselines
+
+Phase 2 adds temporal feature extraction and vehicle-specific statistical anomaly detection, building on Phase 1 telemetry.
+
+**New modules:**
+- `edge/features.py` — rolling features: temp mean/std/slope, RPM variability, speed change rate, voltage trend, fuel rate, idle duration
+- `edge/baseline.py` — per-vehicle Welford running baseline; configurable readiness threshold; outlier and fault-period exclusion
+- `edge/scoring.py` — z-score deviation scoring with configurable ELEVATED/SEVERE thresholds
+- `edge/pipeline.py` — wires feature extraction, baseline updates, and scoring; called after raw telemetry is safely stored
+
+**API endpoints added:** `/features/{id}`, `/baseline/{id}`, `/scores/{id}`
+
+**Phase 2 is complete.** ✅
+
+---
+
+## Phase 3 — LSTM Autoencoder Anomaly Detection
+
+Phase 3 adds an LSTM autoencoder that learns normal temporal patterns and detects anomalous sequences through reconstruction error. The existing Phase 2 statistical detector remains unchanged.
+
+### What Phase 3 adds
+
+- **LSTM autoencoder** (`lstm/model.py`): encoder-decoder architecture, input `(batch, seq_len=30, 12 features)`, hidden dim 32, MSE reconstruction loss
+- **Data pipeline** (`lstm/dataset.py`): leakage-safe splits, median imputation, MinMax scaling, boundary-safe sequence building
+- **Training** (`lstm/train.py`): offline training with early stopping, best-checkpoint restoration, explicit CLI
+- **Artifacts** (`lstm/artifacts.py`): atomic save/load of model weights, scaler/imputer parameters, threshold, and metadata
+- **Inference** (`lstm/inference.py`): threshold calibration (95th-percentile of healthy val errors), per-vehicle bounded sequence buffers, `AnomalyScorer`
+- **Evaluation** (`lstm/evaluate.py`): comparative evaluation vs Phase 2 with sequence-level and event-level metrics
+- **API endpoints**: `GET /lstm/status`, `GET /lstm/anomaly/{vehicle_id}`
+
+### Phase 2 vs Phase 3 comparison
+
+| Aspect | Phase 2 (Statistical) | Phase 3 (LSTM) |
+|---|---|---|
+| Method | Z-score per feature vs running baseline | MSE reconstruction error on temporal sequences |
+| What it detects | Per-feature deviation from per-vehicle norm | Unusual temporal pattern across all 12 features |
+| Training required | No (baselines update online) | Yes (offline, explicit `python -m lstm.train`) |
+| Warm-up | ~30 samples per feature | `seq_len` (default 30) observations |
+| Result | Per-feature severity level | Single reconstruction error + threshold |
+| Interpretability | "feature X is N std devs above baseline" | "sequence is temporally unusual" |
+| Online retraining | Automatic (online Welford update) | Never (offline only) |
+
+### Dependencies
+
+PyTorch and NumPy are required. Both are listed in `requirements.txt` and installed in the `.venv`.
+
+```powershell
+pip install -r requirements.txt
+```
+
+### Step 1: Prepare training data and train the model
+
+Training uses the existing Phase 1 simulator internally. No manual data export is needed.
+
+```powershell
+# Train with default settings (seed=42, 600 steps/vehicle, seq_len=30, hidden=32)
+python -m lstm.train
+
+# Train with explicit options
+python -m lstm.train --seq-len 30 --hidden-dim 32 --epochs 100 --seed 42 --model-dir models/
+```
+
+Configurable parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--seq-len` | 30 | Observations per sequence |
+| `--hidden-dim` | 32 | LSTM hidden state size |
+| `--epochs` | 100 | Maximum training epochs |
+| `--batch-size` | 32 | Mini-batch size |
+| `--lr` | 1e-3 | Adam learning rate |
+| `--patience` | 10 | Early stopping patience |
+| `--seed` | 42 | Random seed |
+| `--model-dir` | models/ | Artifact output directory |
+| `--train-steps` | 600 | Simulation steps for training split |
+| `--val-steps` | 600 | Simulation steps for validation split |
+
+The trained model is saved to `models/` (ignored by git).
+
+### Step 2: Calibrate the anomaly threshold
+
+Threshold calibration uses healthy validation sequences only and is run automatically during evaluation, or can be triggered explicitly in Python:
+
+```python
+from lstm.inference import calibrate_threshold
+from lstm.artifacts import load_model
+from lstm.dataset import prepare_standard_splits
+
+train_split, val_split, _ = prepare_standard_splits(seq_len=30)
+artifact = load_model("models/")
+threshold = calibrate_threshold(
+    val_sequences=val_split.sequences,
+    model=artifact["model"],
+    imputer=artifact["imputer"],
+    scaler=artifact["scaler"],
+    percentile=95.0,
+    model_dir="models/",
+)
+```
+
+### Step 3: Run evaluation
+
+```powershell
+# Evaluate using an existing trained model
+python -m lstm.evaluate
+
+# Retrain and evaluate in one step
+python -m lstm.evaluate --retrain --epochs 100
+
+# Full options
+python -m lstm.evaluate --model-dir models/ --out-dir evaluation-results/ --test-steps 900
+```
+
+Results are written to `evaluation-results/` (ignored by git):
+- `results.json` — machine-readable metrics
+- `report.md` — human-readable Markdown report
+
+### Step 4: Enable LSTM inference in the consumer
+
+The LSTM inference hook is disabled by default. To enable it, initialise `FeaturePipeline` with:
+
+```python
+from edge.pipeline import FeaturePipeline
+pipeline = FeaturePipeline(lstm_enabled=True, lstm_model_dir="models/")
+```
+
+Or set environment variables and modify `edge/consumer.py` to pass `lstm_enabled=True`.
+
+### Interpreting reconstruction error and threshold
+
+- **Reconstruction error** is the MSE between the model's reconstructed sequence and the original input.
+- A **high reconstruction error** means the sequence is temporally unusual relative to the healthy patterns learned during training.
+- The **threshold** is the 95th percentile of reconstruction errors on healthy validation sequences.
+- A result above the threshold is flagged as `is_anomalous=True`.
+- Reconstruction error does **not** identify a specific fault type. It only indicates that the observed temporal pattern is unusual.
+- A false alarm can occur when a vehicle operates in a mode not represented in training (e.g. prolonged idling, unusual acceleration).
+
+### Current limitations and known failure modes
+
+- All training, validation, and test data are generated from a software simulator. Real-world performance may differ significantly.
+- Phase 2 baseline may not converge well with short training runs (~600 steps). Longer runs improve baseline quality.
+- Overlapping sliding windows inflate sequence-level TP/FP counts. Use event-level metrics for a fair comparison.
+- The LSTM is trained on normal driving across three vehicles. Faults that affect all vehicles simultaneously (e.g. shared sensor error) may not be detected if they also shift the baseline.
+- Wall-clock `event_timestamp` from the simulator reflects execution speed, not simulation time. The dataset pipeline uses `sim_time` to guarantee monotonic timestamps. This is documented in `lstm/dataset.py`.
+- Do not interpret simulator results as a guarantee of real-world anomaly detection accuracy.
+
+### Phase 3 is complete. ✅

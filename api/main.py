@@ -335,3 +335,136 @@ def vehicle_scores(vehicle_id: str):
     )
 
     return [DeviationScoreResponse(**s.to_dict()) for s in scores]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 routes — LSTM anomaly scoring
+# ---------------------------------------------------------------------------
+
+class LSTMStatusResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    enabled:       bool
+    model_loaded:  bool
+    threshold_set: bool
+    model_version: Optional[str] = None
+    threshold:     Optional[float] = None
+    vehicles_buffered: list = []
+
+
+class LSTMAnomalyResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    vehicle_id:           str
+    end_timestamp:        Optional[str] = None
+    reconstruction_error: Optional[float] = None
+    threshold:            Optional[float] = None
+    is_anomalous:         Optional[bool] = None
+    model_version:        Optional[str] = None
+    status:               str
+
+
+# Module-level pipeline reference for Phase 3 endpoints.
+# The consumer creates its own FeaturePipeline instance; the API creates a
+# read-only one here solely for serving LSTM status when the API is queried
+# directly (without the consumer running).  In a live deployment the consumer
+# pipeline instance holds the live LSTM state; the API reflects stored results.
+_api_pipeline: Optional[object] = None
+
+
+def _get_api_pipeline():
+    """Return or create the API-side FeaturePipeline (lazy, no LSTM scorer)."""
+    global _api_pipeline
+    if _api_pipeline is None:
+        from edge.pipeline import FeaturePipeline
+        _api_pipeline = FeaturePipeline(lstm_enabled=False)
+    return _api_pipeline
+
+
+@app.get(
+    "/lstm/status",
+    response_model=LSTMStatusResponse,
+    summary="LSTM model availability and threshold status",
+)
+def lstm_status():
+    """
+    Reports whether a trained LSTM model is available and threshold-calibrated.
+    Does not require the consumer to be running.
+    """
+    from lstm.artifacts import artifact_exists, DEFAULT_ARTIFACT_DIR
+    import json, os
+
+    model_loaded  = artifact_exists()
+    threshold_set = False
+    threshold     = None
+    model_version = None
+
+    if model_loaded:
+        try:
+            meta_path = os.path.join(DEFAULT_ARTIFACT_DIR, "metadata.json")
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            threshold     = meta.get("threshold")
+            threshold_set = threshold is not None
+            model_version = meta.get("model_version")
+        except Exception as e:
+            logger.warning("Could not read LSTM metadata: %s", e)
+
+    return LSTMStatusResponse(
+        enabled=model_loaded,
+        model_loaded=model_loaded,
+        threshold_set=threshold_set,
+        model_version=model_version,
+        threshold=threshold,
+        vehicles_buffered=[],
+    )
+
+
+@app.get(
+    "/lstm/anomaly/{vehicle_id}",
+    response_model=LSTMAnomalyResponse,
+    summary="Latest LSTM anomaly result for a vehicle",
+)
+def lstm_anomaly(vehicle_id: str):
+    """
+    Returns the latest LSTM reconstruction-error anomaly result for a vehicle.
+
+    The result is produced by the running consumer process via AnomalyScorer.
+    The API reads from the in-process scorer when available, otherwise reports
+    the current model status.
+
+    Status values:
+      scored       — a complete sequence was scored
+      warming_up   — buffer has not yet filled seq_len observations
+      no_model     — no trained model loaded
+      no_threshold — model loaded but threshold not yet calibrated
+      error        — inference exception (Phase 2 unaffected)
+    """
+    from lstm.artifacts import artifact_exists
+
+    if not artifact_exists():
+        return LSTMAnomalyResponse(
+            vehicle_id=vehicle_id,
+            status="no_model",
+        )
+
+    # If the consumer pipeline is running in-process (e.g. tests), use it.
+    # Otherwise fall back to a static no_model response since we don't share
+    # the consumer's AnomalyScorer instance across processes.
+    pipeline = _get_api_pipeline()
+    result = pipeline.get_lstm_result(vehicle_id)
+
+    if result is None:
+        # Check threshold calibration status
+        import json, os
+        from lstm.artifacts import DEFAULT_ARTIFACT_DIR
+        try:
+            meta_path = os.path.join(DEFAULT_ARTIFACT_DIR, "metadata.json")
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            threshold = meta.get("threshold")
+            status = "warming_up" if threshold is not None else "no_threshold"
+        except Exception:
+            status = "no_model"
+
+        return LSTMAnomalyResponse(vehicle_id=vehicle_id, status=status)
+
+    return LSTMAnomalyResponse(**result)

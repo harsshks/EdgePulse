@@ -1,24 +1,20 @@
 # edge/pipeline.py
-# Feature-engineering pipeline integration for EdgePulse Phase 2.
+# Feature-engineering pipeline integration for EdgePulse Phase 2 + 3.
 #
 # This module wires together:
 #   1. FeatureWindow  — per-vehicle rolling feature extraction
 #   2. VehicleBaseline — per-vehicle statistical baselines
-#   3. score_all_features — z-score deviation scoring
+#   3. score_all_features — z-score deviation scoring (Phase 2)
+#   4. AnomalyScorer (optional) — LSTM reconstruction-error scoring (Phase 3)
 #
-# The pipeline is called AFTER raw telemetry is persisted to SQLite.
-# If feature extraction fails, the exception is caught and logged here;
-# the caller (consumer) must ensure raw telemetry is already written
-# before calling process_record().
-#
-# Baseline contamination protection at runtime:
-#   - Duplicate/out-of-order timestamps are rejected inside FeatureWindow
-#     and FeatureBaseline — they cannot silently corrupt state.
-#   - Non-finite feature values are rejected by FeatureBaseline.
-#   - The `exclude` flag can be set to True by callers who have out-of-band
-#     knowledge that a fault is active (offline evaluation only).
-#   - Without ground truth, gradual faults may slowly drift the baseline.
-#     This is a known limitation documented in the README.
+# Phase 3 integration policy:
+#   - AnomalyScorer is optional. It is disabled when no trained model artifact
+#     exists or when lstm_model_dir is not provided.
+#   - LSTM inference runs AFTER Phase 2 scoring is complete.
+#   - Inference failures are caught and logged; they never interrupt
+#     raw telemetry persistence or Phase 2 scoring.
+#   - Model loading happens once at FeaturePipeline init, not per message.
+#   - No training occurs at runtime.
 #
 # Persistence:
 #   - Baselines are persisted to SQLite on every update so they survive restarts.
@@ -46,6 +42,21 @@ from database.db import upsert_baseline, get_baselines_for_vehicle
 
 logger = logging.getLogger("edgepulse.pipeline")
 
+# Lazy import for LSTM inference — keeps Phase 2 functional if lstm package
+# is absent or artifacts are missing.
+_AnomalyScorer = None
+
+
+def _get_anomaly_scorer_class():
+    global _AnomalyScorer
+    if _AnomalyScorer is None:
+        try:
+            from lstm.inference import AnomalyScorer
+            _AnomalyScorer = AnomalyScorer
+        except ImportError:
+            pass
+    return _AnomalyScorer
+
 
 class FeaturePipeline:
     """
@@ -70,6 +81,8 @@ class FeaturePipeline:
         warn_z:             float = SCORE_WARNING_THRESHOLD,
         severe_z:           float = SCORE_SEVERE_THRESHOLD,
         persist_features:   bool  = False,
+        lstm_model_dir:     Optional[str] = None,
+        lstm_enabled:       bool  = False,
     ):
         self._window_size      = window_size
         self._min_samples      = min_samples
@@ -80,6 +93,24 @@ class FeaturePipeline:
 
         self._windows:  dict[str, FeatureWindow]  = {}
         self._registry: BaselineRegistry = BaselineRegistry(min_samples=baseline_min)
+
+        # Phase 3: optional LSTM anomaly scorer
+        # Loaded once here; never reloaded per message.
+        self._anomaly_scorer = None
+        if lstm_enabled:
+            ScorerClass = _get_anomaly_scorer_class()
+            if ScorerClass is not None:
+                try:
+                    self._anomaly_scorer = ScorerClass(
+                        model_dir=lstm_model_dir,
+                        enabled=True,
+                    )
+                    logger.info(
+                        "LSTM AnomalyScorer initialised (ready=%s)",
+                        self._anomaly_scorer.is_ready,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to initialise AnomalyScorer: %s", e)
 
     # ------------------------------------------------------------------
     # Startup
@@ -178,6 +209,20 @@ class FeaturePipeline:
                     s.vehicle_id, s.feature_name, s.z_score or 0.0, s.level.value,
                 )
 
+        # --- Phase 3: LSTM anomaly scoring (optional, after Phase 2) ---
+        if self._anomaly_scorer is not None:
+            try:
+                self._anomaly_scorer.push(
+                    vehicle_id=vid,
+                    fv_dict=fv.to_dict(),
+                    event_timestamp=record.get("event_timestamp", ""),
+                )
+            except Exception as e:
+                logger.error(
+                    "LSTM inference error for vehicle '%s': %s — Phase 2 unaffected.",
+                    vid, e,
+                )
+
         return fv, scores
 
     # ------------------------------------------------------------------
@@ -228,3 +273,23 @@ class FeaturePipeline:
         if vb is None:
             return None
         return vb.summary()
+
+    # ------------------------------------------------------------------
+    # Phase 3 accessors
+    # ------------------------------------------------------------------
+
+    def get_lstm_result(self, vehicle_id: str) -> Optional[dict]:
+        """
+        Return the latest LSTM anomaly result for a vehicle, or None.
+        Returns None when LSTM is disabled or the buffer is still warming up.
+        """
+        if self._anomaly_scorer is None:
+            return None
+        result = self._anomaly_scorer.get_latest(vehicle_id)
+        return result.to_dict() if result is not None else None
+
+    def get_lstm_status(self) -> dict:
+        """Return LSTM scorer status summary for the API /lstm/status endpoint."""
+        if self._anomaly_scorer is None:
+            return {"enabled": False, "model_loaded": False, "threshold_set": False}
+        return self._anomaly_scorer.status_summary()
