@@ -419,6 +419,108 @@ def lstm_status():
 
 
 @app.get(
+    "/health/{vehicle_id}",
+    summary="Combined vehicle health assessment",
+)
+def vehicle_health(vehicle_id: str):
+    """
+    Returns a combined health assessment for a vehicle by aggregating:
+      - Phase 2 statistical deviation scores (z-score per feature vs baseline)
+      - Phase 3 LSTM reconstruction-error anomaly result (when available)
+      - Critical sensor hard limits (engine_temp, battery_voltage, rpm)
+
+    Status values:
+      NORMAL — all scored signals within normal range
+      WATCH  — elevated z-scores or LSTM warming up / threshold not calibrated
+      ALERT  — severe z-score, LSTM anomalous, or critical sensor condition
+
+    Reasons and supporting evidence are always included for non-NORMAL status.
+    Unavailable LSTM output is noted but never treated as proof of health.
+
+    Returns 404 if no telemetry or baseline data exists for this vehicle.
+    """
+    from edge.health import assess_vehicle_health
+
+    # --- Gather Phase 2 deviation scores ---
+    try:
+        fv_dict, _ = _build_feature_window_for_vehicle(vehicle_id)
+        baseline_rows = get_baselines_for_vehicle(vehicle_id)
+    except Exception as e:
+        logger.error("Health assessment failed for '%s': %s", vehicle_id, e)
+        raise HTTPException(status_code=503, detail="Scoring error")
+
+    if fv_dict is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No telemetry found for vehicle '{vehicle_id}'.",
+        )
+
+    registry = BaselineRegistry(min_samples=BASELINE_MIN_SAMPLES)
+    if baseline_rows:
+        registry.load_from_db(baseline_rows)
+    vb = registry.get_or_create(vehicle_id)
+
+    scores = score_all_features(
+        vehicle_id=vehicle_id,
+        fv_dict=fv_dict,
+        vehicle_baseline=vb,
+        event_timestamp=fv_dict.get("event_timestamp", ""),
+        warning_threshold=SCORE_WARNING_THRESHOLD,
+        severe_threshold=SCORE_SEVERE_THRESHOLD,
+    )
+    score_dicts = [s.to_dict() for s in scores]
+
+    # --- Gather Phase 3 LSTM result (best-effort, never mandatory) ---
+    lstm_result: Optional[dict] = None
+    try:
+        from lstm.artifacts import artifact_exists
+        if artifact_exists():
+            pipeline = _get_api_pipeline()
+            lstm_result = pipeline.get_lstm_result(vehicle_id)
+            if lstm_result is None:
+                import json, os
+                from lstm.artifacts import DEFAULT_ARTIFACT_DIR
+                try:
+                    meta_path = os.path.join(DEFAULT_ARTIFACT_DIR, "metadata.json")
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    threshold = meta.get("threshold")
+                    lstm_result = {
+                        "vehicle_id": vehicle_id,
+                        "status": "warming_up" if threshold is not None else "no_threshold",
+                        "reconstruction_error": None,
+                        "threshold": threshold,
+                        "is_anomalous": None,
+                        "model_version": meta.get("model_version"),
+                        "end_timestamp": None,
+                    }
+                except Exception:
+                    lstm_result = {"vehicle_id": vehicle_id, "status": "no_model"}
+        else:
+            lstm_result = {"vehicle_id": vehicle_id, "status": "no_model"}
+    except Exception as e:
+        logger.warning("Could not retrieve LSTM result for health endpoint: %s", e)
+        lstm_result = {"vehicle_id": vehicle_id, "status": "error"}
+
+    # --- Gather raw telemetry for critical-sensor checks ---
+    raw_telemetry: Optional[dict] = None
+    try:
+        rows = get_telemetry_by_vehicle(vehicle_id=vehicle_id, limit=1)
+        if rows:
+            raw_telemetry = rows[0]
+    except Exception:
+        pass
+
+    result = assess_vehicle_health(
+        vehicle_id=vehicle_id,
+        deviation_scores=score_dicts,
+        lstm_result=lstm_result,
+        raw_telemetry=raw_telemetry,
+    )
+    return result.to_dict()
+
+
+@app.get(
     "/lstm/anomaly/{vehicle_id}",
     response_model=LSTMAnomalyResponse,
     summary="Latest LSTM anomaly result for a vehicle",

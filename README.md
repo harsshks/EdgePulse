@@ -457,7 +457,8 @@ Realistic multi-vehicle simulation with five fault types, full lifecycle trackin
 | ✅ 1 | Stateful simulation, fault injection, ground-truth labeling |
 | ✅ 2 | Edge feature engineering + vehicle-specific baselines |
 | ✅ 3 | LSTM-based temporal anomaly detection |
-| ⬜ 4 | Docker containerisation |
+| ✅ 4 | Reliability & explainable fleet health |
+| ⬜ 5 | Docker containerisation |
 | ⬜ 5 | CI/CD — GitHub Actions |
 | ⬜ 6 | Cloud deployment (AWS) |
 | ⬜ 7 | Monitoring — Prometheus + Grafana |
@@ -612,3 +613,85 @@ Or set environment variables and modify `edge/consumer.py` to pass `lstm_enabled
 - Do not interpret simulator results as a guarantee of real-world anomaly detection accuracy.
 
 ### Phase 3 is complete. ✅
+
+
+---
+
+## Phase 4 — Reliability & Explainable Fleet Health
+
+Phase 4 adds a deterministic decision layer (`edge/health.py`) that combines Phase 2 and Phase 3 signals into a single fleet-health status per vehicle, and exposes it via a new API endpoint.
+
+### New module: `edge/health.py`
+
+`assess_vehicle_health(vehicle_id, deviation_scores, lstm_result, raw_telemetry)` is a pure function (no I/O, no ML) that returns a `VehicleHealthResult` with:
+
+| Field | Description |
+|---|---|
+| `status` | `NORMAL`, `WATCH`, or `ALERT` |
+| `reasons` | List of human-readable strings explaining any non-NORMAL status |
+| `evidence` | Dict of signal → value for every contributing signal |
+| `phase2_scored` | Whether Phase 2 baselines were ready |
+| `lstm_status` | Forwarded LSTM status string |
+| `lstm_anomalous` | Forwarded LSTM anomaly flag |
+
+### Decision rules (in precedence order)
+
+1. **Critical sensor hard limits** (engine_temp ≥ 115 °C, battery_voltage ≤ 11 V, rpm ≥ 8000) → `ALERT`
+2. **Phase 2 SEVERE z-score** (|z| ≥ 3.5) on any feature → `ALERT`
+3. **LSTM anomalous** (`is_anomalous=True`) → `ALERT`
+4. **Phase 2 ELEVATED z-score** (|z| ≥ 2.0) → `WATCH`
+5. **LSTM warming up / no threshold / error** → `WATCH`
+6. All signals within normal range → `NORMAL`
+
+### Unavailability policy
+
+- Unavailable LSTM output (`no_model`, `warming_up`, `no_threshold`, `error`) is **never** treated as proof of health. It is always noted in `reasons`.
+- Phase 2 `INSUFFICIENT_DATA` features are excluded from the decision but noted when all features are insufficient.
+- The system never claims fault-type diagnosis or failure-time prediction.
+
+### New API endpoint
+
+```
+GET /health/{vehicle_id}
+```
+
+Returns the combined health assessment. Uses Phase 2 scores and LSTM result from existing endpoints — no database migration required.
+
+Example response:
+```json
+{
+  "vehicle_id": "CAR-01",
+  "status": "ALERT",
+  "reasons": [
+    "SEVERE deviation on: engine_temp",
+    "LSTM reconstruction error 0.3120 exceeds threshold 0.1045"
+  ],
+  "evidence": {
+    "engine_temp": {"z_score": 4.2, "level": "SEVERE", "current_value": 108.3, "baseline_mean": 89.1},
+    "lstm_reconstruction_error": 0.312,
+    "lstm_threshold": 0.1045
+  },
+  "phase2_scored": true,
+  "lstm_status": "scored",
+  "lstm_anomalous": true
+}
+```
+
+### Running Phase 4 tests
+
+```powershell
+# Focused Phase 4 tests only
+python -m pytest tests/test_health.py -v
+
+# Full suite (excludes LSTM tests when numpy/torch not installed)
+python -m pytest tests/ --ignore=tests/test_lstm_dataset.py --ignore=tests/test_lstm_evaluate.py --ignore=tests/test_lstm_inference.py --ignore=tests/test_lstm_model.py -v
+```
+
+### Current limitations
+
+- Health status reflects the current observation window only — it is not a time-series trend or predictive score.
+- LSTM inference is in-memory and not persisted; restarting the API resets the per-vehicle buffer.
+- All evaluation data is synthetic. The decision thresholds (z-score 2.0 / 3.5, temperature 115 °C, battery 11 V) are physically motivated but not validated against real fleet data.
+- The system does not identify fault type or remaining useful life.
+
+### Phase 4 is complete. ✅
