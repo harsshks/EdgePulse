@@ -79,60 +79,116 @@ EdgePulse addresses this by:
 
 ---
 
+
 ## Architecture
+
+EdgePulse is organised into eight logical layers. The ingestion pipeline processes incoming telemetry, two complementary detectors analyse vehicle behaviour, and a deterministic decision layer produces the final health assessment.
 
 ```mermaid
 flowchart TD
-    SIM["Vehicle Simulator\n(simulator/)"]
-    MQTT["MQTT Broker\n(Mosquitto, port 1883)"]
-    CON["Edge Consumer\n(edge/consumer.py)"]
-    DB["SQLite\n(edgepulse.db)"]
-    LOG["JSONL Audit Log\n(logs/telemetry.jsonl)"]
-    FE["Feature Engineering\n(edge/features.py)"]
-    BL["Statistical Baselines\n(edge/baseline.py)"]
-    SC["Z-Score Scorer\n(edge/scoring.py)"]
-    LSTM_INF["LSTM Inference\n(lstm/inference.py)\n[optional — requires trained model]"]
-    HL["Health Decision Layer\n(edge/health.py)"]
-    API["FastAPI\n(api/main.py)"]
-    CLIENT["HTTP Client / Dashboard"]
+    A["1. Vehicle Simulator<br/>Generate telemetry and simulated faults"]
+    B["2. MQTT Messaging<br/>Mosquitto broker"]
+    C["3. Data Ingestion<br/>Validate, deduplicate and persist"]
+    D["4. Feature Engineering<br/>Extract rolling and temporal features"]
+    E["5. Statistical Detection<br/>Vehicle baselines and Z-scores"]
+    F["6. LSTM Autoencoder<br/>Sequence reconstruction error"]
+    G["7. Health Decision Layer<br/>NORMAL / WATCH / ALERT"]
+    H["8. FastAPI REST API<br/>Serve telemetry and health results"]
+    I["HTTP Client / Dashboard"]
 
-    SIM -->|"MQTT publish"| MQTT
-    MQTT -->|"QoS 1 subscribe"| CON
-    CON -->|"INSERT OR IGNORE"| DB
-    CON -->|"append"| LOG
-    CON --> FE
-    FE --> BL
-    BL -->|"upsert"| DB
-    FE --> SC
-    FE --> LSTM_INF
-    SC --> HL
-    LSTM_INF --> HL
-    DB -->|"replay telemetry"| API
-    API --> HL
-    HL --> API
-    API --> CLIENT
+    C --> A1[("SQLite: telemetry and baselines")]
+    C --> A2[("JSONL audit log")]
+
+    A --> B --> C --> D
+    D --> E
+    D -. "When model is available" .-> F
+    E --> G
+    F --> G
+    A1 --> H
+    H --> G
+    G --> H
+    H --> I
+
+    classDef source fill:#e8f0fe,stroke:#4776c5,color:#172554
+    classDef processing fill:#e9f7ef,stroke:#399566,color:#123524
+    classDef storage fill:#fff4df,stroke:#c28b28,color:#513b12
+    classDef output fill:#f1e8ff,stroke:#8a62bd,color:#35204e
+
+    class A,B source
+    class C,D,E,F,G processing
+    class A1,A2 storage
+    class H,I output
 ```
 
-**Notes:**
-- The consumer processes records in-order: persist → feature extract → baseline update → score → LSTM push.
-- LSTM inference is optional at runtime. If no trained model artifact exists, Phase 2 scoring and raw telemetry persistence continue unaffected.
-- The API reconstructs feature vectors by replaying stored telemetry through `FeatureWindow`; it does not share the consumer's in-memory state.
+**Architecture notes**
+
+- The consumer persists raw telemetry before running the feature pipeline.
+- Statistical baseline updates and Z-score scoring operate independently of LSTM inference.
+- LSTM inference is optional at runtime; statistical scoring and raw telemetry persistence can continue without a trained model.
+- The health decision layer applies explicit rules and returns human-readable reasons and supporting evidence.
+- The API reconstructs features from stored telemetry and obtains the LSTM result from the in-process scorer when available.
+- The project currently uses simulated telemetry rather than physical vehicle sensors.
 
 ---
 
 ## End-to-End Data Flow
 
-1. **Simulator** generates a telemetry record every ~1 s per vehicle (speed, RPM, engine temp, battery voltage, fuel level, optional fault label) and publishes it as JSON over MQTT.
+### 1. Vehicle Simulation
 
-2. **Consumer** receives the message, validates all fields and ranges, enriches it with `ingestion_timestamp` and a `message_id` UUID if absent, then writes it to SQLite with `INSERT OR IGNORE` (deduplication by `message_id`). The JSONL log is written even if SQLite fails.
+The simulator generates a telemetry record approximately every second per vehicle. Records contain sensor readings such as speed, RPM, engine temperature, battery voltage, and fuel level. Configurable fault injection creates scenarios for offline evaluation.
 
-3. **Feature pipeline** runs synchronously after each successful DB insert:
-   - `FeatureWindow` computes rolling stats, slopes, rate-of-change, and cross-signal features over a sliding window of up to 60 observations.
-   - `VehicleBaseline` updates per-feature Welford accumulators and persists them to `vehicle_baselines`.
-   - `score_all_features` computes z-scores against baselines, producing NORMAL / ELEVATED / SEVERE per feature.
-   - `AnomalyScorer.push()` (when a trained model is loaded) adds the feature vector to a per-vehicle buffer and scores complete 30-step sequences via the LSTM.
+### 2. MQTT Messaging
 
-4. **API** serves stored data on demand. The `/health/{vehicle_id}` endpoint re-computes scores from stored telemetry, reads the LSTM result from the in-process scorer (when available), applies hard sensor limits, and returns a structured `NORMAL / WATCH / ALERT` assessment with reasons and evidence.
+The simulator publishes telemetry as JSON through the Mosquitto MQTT broker. The Python consumer subscribes to the configured topic using Paho-MQTT. QoS 1 provides at-least-once delivery, so duplicate messages must be handled by the application.
+
+### 3. Data Ingestion and Persistence
+
+The consumer validates incoming messages, adds missing ingestion metadata and a message ID, and writes raw telemetry to SQLite using `INSERT OR IGNORE`. It also appends records to a JSONL audit log.
+
+After a successful database insertion, the record enters the feature-processing pipeline. Feature-processing failures are caught and logged so they do not interrupt the normal ingestion path.
+
+### 4. Feature Engineering
+
+`FeatureWindow` processes recent observations using a sliding window of up to 60 observations. It calculates rolling statistics, slopes, rates of change, and other temporal features using event timestamps.
+
+These features describe recent vehicle behaviour rather than relying only on individual sensor readings.
+
+### 5. Statistical Anomaly Detection
+
+`VehicleBaseline` maintains per-vehicle, per-feature running statistics using Welford's algorithm and persists baseline state to SQLite.
+
+`score_all_features` calculates Z-scores against the baselines and classifies feature deviations as `NORMAL`, `ELEVATED`, or `SEVERE`. Features without enough baseline samples remain `INSUFFICIENT_DATA`.
+
+### 6. LSTM Autoencoder Anomaly Detection
+
+When a trained model is available, `AnomalyScorer` maintains a bounded sequence buffer for each vehicle. Once 30 observations are available, the LSTM autoencoder reconstructs the sequence and calculates its mean squared reconstruction error.
+
+The error is compared with a threshold calibrated using healthy validation sequences. A score above the threshold flags a potentially anomalous temporal pattern.
+
+### 7. Deterministic Health Decision
+
+`assess_vehicle_health()` combines hard sensor limits, statistical scores, and available LSTM results using explicit precedence rules.
+
+The function produces one of three vehicle-health statuses:
+
+- `NORMAL`: no configured warning or alert condition is triggered by the available evidence.
+- `WATCH`: an elevated deviation is detected or LSTM evidence is unavailable or incomplete.
+- `ALERT`: a hard sensor limit is crossed, a severe statistical deviation is detected, or the LSTM flags an anomaly.
+
+Non-normal assessments include human-readable reasons and structured supporting evidence.
+
+### 8. FastAPI REST API
+
+FastAPI exposes read-only endpoints for telemetry, feature vectors, baselines, statistical scores, LSTM status, and vehicle health.
+
+For `GET /health/{vehicle_id}`, the API reconstructs features by replaying stored telemetry, obtains the available LSTM result from the in-process scorer, applies the health decision rules, and returns a structured JSON assessment.
+
+### Runtime Considerations
+
+- Raw telemetry and statistical baselines are persisted, but LSTM sequence buffers are held in memory and must warm up again after a relevant process restart.
+- LSTM inference is optional, so the statistical pipeline can continue when a trained model is unavailable.
+- JSONL provides an additional audit trail, but it is not a guarantee against all storage failures.
+- All telemetry and evaluation results are based on synthetic scenarios; real-world detection performance has not yet been established.
 
 ---
 
